@@ -115,9 +115,6 @@ function renderWorkspace(
         terminalsLength={0}
         subagentsWorking={0}
         agentCount={1}
-        todosSupported={false}
-        todosCompleted={0}
-        todosTotal={0}
         rootSessionId={null}
         selectedFilePath={overrides.selectedFilePath ?? null}
         openFiles={overrides.openFiles ?? []}
