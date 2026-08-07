@@ -259,7 +259,7 @@ function NewTabMenu({
 
 // ---------------------------------------------------------------------------
 // FileTabsStrip — open file tabs rendered in the top rail tab strip, as peers
-// of the fixed Files/Terminals/Agents/Tasks tabs. Each tab is a cell with the
+// of the fixed Files/Terminals/Agents tabs. Each tab is a cell with the
 // file's basename and an "x" close button. Clicking the cell activates the
 // tab (opening its viewer); clicking the x closes it. No own scroll container
 // or flex-1: the parent strip's overflow-x-auto scrolls the whole row.
@@ -594,7 +594,7 @@ interface WorkspacePanelProps {
  * WorkspacePanel — the desktop right "Workspace" rail, rendered as a
  * floating card (bg-card, rounded, bordered, shadowed) sitting below the
  * full-width chat header band. Internally tabbed between Files, Changes,
- * Terminals, Agents and Tasks so each can claim the full rail height
+ * Terminals and Agents so each can claim the full rail height
  * instead of competing for a vertically-split slot.
  *
  * Desktop-only (``hidden md:flex``): on mobile the rail's contents are
@@ -690,7 +690,7 @@ export function WorkspacePanel({
           className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
         />
       )}
-      {/* Tab strip, in display order Files · Changes · Agents · Shells · Tasks.
+      {/* Tab strip, in display order Files · Changes · Agents · Shells.
           Files (full folder tree) and Changes (changed-files-only list) are
           two peer tabs — same gate (an on-disk workspace), same FilesPanel,
           each pinned to one scope. Agents is always present (the Agents panel
