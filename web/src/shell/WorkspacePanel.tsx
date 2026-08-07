@@ -5,7 +5,6 @@ import {
   FilesIcon,
   GitCompareIcon,
   GlobeIcon,
-  ListTodoIcon,
   Loader2Icon,
   MaximizeIcon,
   MinimizeIcon,
@@ -40,7 +39,6 @@ import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { SubagentsPanel } from "./SubagentsPanel";
-import { TodoPanel } from "./TodoPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
 
@@ -543,12 +541,6 @@ interface WorkspacePanelProps {
    * badge denominator) — starts at 1 for a lone agent.
    */
   agentCount: number;
-  /** Whether the session publishes a todo list (gates the Tasks tab). */
-  todosSupported: boolean;
-  /** Number of completed todos (Tasks tab badge numerator). */
-  todosCompleted: number;
-  /** Total todo count (Tasks tab badge denominator + visibility gate). */
-  todosTotal: number;
   /**
    * The "root" session id for the Agents tab — the active session's
    * parent when inside a child, else the active id. May be null while
@@ -627,9 +619,6 @@ export function WorkspacePanel({
   terminalsLength,
   subagentsWorking,
   agentCount,
-  todosSupported,
-  todosCompleted,
-  todosTotal,
   rootSessionId,
   selectedFilePath,
   openFiles,
@@ -795,21 +784,6 @@ export function WorkspacePanel({
                 </TabsTrigger>
               </WorkspaceTabTooltip>
             )}
-            {todosSupported && todosTotal > 0 && (
-              <WorkspaceTabTooltip label="Tasks">
-                <TabsTrigger
-                  value="todos"
-                  aria-label={`Tasks ${todosCompleted} of ${todosTotal} completed`}
-                  className="size-8 shrink-0 rounded-md p-0 hover:bg-muted"
-                >
-                  <ListTodoIcon className="size-4" />
-                  <span className="sr-only">Tasks</span>
-                  <span className="sr-only">
-                    {todosCompleted}/{todosTotal}
-                  </span>
-                </TabsTrigger>
-              </WorkspaceTabTooltip>
-            )}
             {showBrowserTab && (
               <WorkspaceTabTooltip label="Browser">
                 <TabsTrigger
@@ -930,8 +904,6 @@ export function WorkspacePanel({
           <BrowserPane conversationId={conversationId} className="min-h-0 flex-1" />
         ) : rightRailTab === "subagents" && rootSessionId ? (
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-        ) : rightRailTab === "todos" && todosSupported ? (
-          <TodoPanel frameless />
         ) : rightRailTab === "terminals" && showShellsTab ? (
           <InlineTerminalsSection conversationId={conversationId} onExpand={openTerminalTab} />
         ) : (

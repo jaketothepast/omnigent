@@ -1708,9 +1708,6 @@ export function AppShell() {
                     terminalsLength={railTerminals.length}
                     subagentsWorking={subagentsWorking}
                     agentCount={agentCount}
-                    todosSupported={todosSupported}
-                    todosCompleted={todosCompleted}
-                    todosTotal={todos.length}
                     rootSessionId={rootSessionId}
                     selectedFilePath={selectedFilePath}
                     openFiles={openFiles}
