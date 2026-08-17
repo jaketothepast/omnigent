@@ -3044,7 +3044,6 @@ describe("Mobile session menu", () => {
     expect(drawer).toHaveAttribute("data-flat-view", "true");
   });
 
-
   it("keeps the FAB with only the Agents entry for a minimal agent", () => {
     // available:false → no files; no shells, no debug. The
     // Agents entry is unconditional (badge = 1, the main agent), so the
