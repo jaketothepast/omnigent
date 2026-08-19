@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -35,15 +36,28 @@ def test_check_version_in_range() -> None:
     check_opencode_version("1.18.16")
 
 
-@pytest.mark.parametrize("version", ["1.16.0", "1.19.0", "2.0.0"])
-def test_check_version_out_of_range_raises(version: str) -> None:
+@pytest.mark.parametrize("version", ["1.16.0", "1.17.6", "1.0.0", "0.9.0"])
+def test_check_version_below_floor_raises(version: str) -> None:
+    """Too old is still fatal: those releases lack the endpoints used."""
     with pytest.raises(OpenCodeVersionError):
         check_opencode_version(version)
 
 
-def test_check_version_unparsable_raises() -> None:
-    with pytest.raises(OpenCodeVersionError):
+@pytest.mark.parametrize("version", ["1.19.0", "1.20.3", "2.0.0", "3.1.4"])
+def test_check_version_above_validated_warns_but_passes(
+    version: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No upper bound: a newer OpenCode warns and runs rather than failing."""
+    with caplog.at_level(logging.WARNING, logger="omnigent.opencode_native_app_server"):
+        check_opencode_version(version)
+    assert any("newer than" in record.message for record in caplog.records)
+
+
+def test_check_version_unparsable_warns_but_passes(caplog: pytest.LogCaptureFixture) -> None:
+    """A non-semver build string gates on packaging, not capability."""
+    with caplog.at_level(logging.WARNING, logger="omnigent.opencode_native_app_server"):
         check_opencode_version("not-a-version")
+    assert any("Could not parse" in record.message for record in caplog.records)
 
 
 def test_find_opencode_cli_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -184,11 +198,12 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert server.process.pid == 4242
 
 
-async def test_start_raises_on_unsupported_version_without_env(
+async def test_start_raises_on_too_old_version_without_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Below the floor is fatal — those releases lack the endpoints used."""
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.19.0")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.16.0")
     monkeypatch.delenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", raising=False)
     server = OpenCodeNativeServer(
         bridge_dir=tmp_path,
@@ -210,6 +225,36 @@ async def test_start_raises_on_unsupported_version_without_env(
     monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
     with pytest.raises(OpenCodeVersionError):
         await server.start()
+
+
+async def test_start_accepts_newer_than_validated_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A newer OpenCode launches (with a warning) instead of being refused."""
+    monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.19.0")
+    monkeypatch.delenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", raising=False)
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path,
+        workspace=tmp_path,
+        port=49231,
+        verify_version=True,
+    )
+
+    class _FakeProc:
+        pid = 4242
+
+        def poll(self) -> None:
+            return None
+
+    async def fake_wait(self: OpenCodeNativeServer) -> None:
+        return None
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", lambda argv, **kwargs: _FakeProc())
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
+    await server.start()
+    assert server.version == "1.19.0"
+    assert server.process is not None
 
 
 async def test_start_skips_version_gate_when_env_set(
@@ -268,7 +313,10 @@ def test_resolve_opencode_version_run_error_raises(monkeypatch: pytest.MonkeyPat
         appsrv.resolve_opencode_version("/x/opencode")
 
 
-def test_resolve_opencode_version_unparseable_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_opencode_version_unparseable_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolution leaves policy and its single warning to the launch gate."""
     import subprocess
 
     monkeypatch.setattr(
@@ -276,8 +324,46 @@ def test_resolve_opencode_version_unparseable_raises(monkeypatch: pytest.MonkeyP
         "run",
         lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="no version here", stderr=""),
     )
-    with pytest.raises(appsrv.OpenCodeVersionError):
-        appsrv.resolve_opencode_version("/x/opencode")
+    assert appsrv.resolve_opencode_version("/x/opencode") is None
+
+
+async def test_start_warns_once_for_unparseable_version(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import subprocess
+
+    monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        appsrv.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="no version here", stderr=""),
+    )
+
+    class _FakeProc:
+        pid = 4242
+
+        def poll(self) -> None:
+            return None
+
+    async def fake_wait(self: OpenCodeNativeServer) -> None:
+        return None
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", lambda argv, **kwargs: _FakeProc())
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path,
+        workspace=tmp_path,
+        port=49231,
+        verify_version=True,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.opencode_native_app_server"):
+        await server.start()
+
+    warnings = [record for record in caplog.records if "Could not parse" in record.message]
+    assert len(warnings) == 1
 
 
 def test_list_opencode_cli_model_options(monkeypatch: pytest.MonkeyPatch) -> None:

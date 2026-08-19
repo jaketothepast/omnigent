@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import omnigent._platform as _platform
+from omnigent.harness_install_spec import HarnessInstallSpec
 from omnigent.onboarding import harness_install as hi
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
@@ -46,6 +47,7 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     "key,binary,package",
     [
         (OPENAI_FAMILY, "codex", "@openai/codex"),
+        (hi.OPENCODE_KEY, "opencode", "opencode-ai@>=1.18.0"),
         (hi.PI_KEY, "pi", "@earendil-works/pi-coding-agent"),
         (hi.QWEN_KEY, "qwen", "@qwen-code/qwen-code"),
     ],
@@ -86,12 +88,20 @@ def test_claude_installs_via_anthropic_native_installer() -> None:
     [
         (ANTHROPIC_FAMILY, "curl -fsSL https://claude.ai/install.sh | bash"),
         (OPENAI_FAMILY, "npm install -g @openai/codex"),
+        (hi.OPENCODE_KEY, "npm install -g 'opencode-ai@>=1.18.0'"),
     ],
 )
 def test_install_display_hides_the_bash_c_wrapper(key: str, expected: str) -> None:
     """The command shown to a user is runnable as-is, without the ``bash -c``
     wrapper :func:`harness_install_command` adds for ``subprocess``."""
     assert hi.harness_install_display(key) == expected
+
+
+def test_install_spec_display_names_invalid_spec() -> None:
+    spec = HarnessInstallSpec(display="Broken harness", binary="broken", package=None)
+
+    with pytest.raises(ValueError, match="Broken harness"):
+        hi.harness_install_spec_display(spec)
 
 
 def test_claude_setup_hint_names_the_native_installer() -> None:
@@ -1276,7 +1286,7 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
 @pytest.mark.parametrize(
     "key,min_version,max_version_exclusive",
     [
-        (hi.OPENCODE_KEY, "1.17.7", "1.19.0"),
+        (hi.OPENCODE_KEY, "1.17.7", None),
         (hi.CURSOR_KEY, "2026.06.02", None),
         (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
@@ -1301,11 +1311,12 @@ def test_versioned_specs_declare_bounds(
 @pytest.mark.parametrize(
     "version,expected",
     [
-        ("1.17.6", False),  # below min
-        ("1.19.0", False),  # at max exclusive
-        ("2.0.0", False),  # above max
-        ("1.17.8", True),  # inside range
-        ("1.18.16", True),  # inside range (1.18.x)
+        ("1.17.6", False),  # below the floor
+        ("1.17.8", True),  # at/above the floor
+        ("1.18.16", True),  # current validated line
+        # No upper bound: newer OpenCode installs are accepted, not refused.
+        ("1.19.0", True),
+        ("2.0.0", True),
     ],
 )
 def test_harness_cli_installed_checks_version_for_versioned_specs(
@@ -1317,7 +1328,7 @@ def test_harness_cli_installed_checks_version_for_versioned_specs(
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
-            # OpenCode's supported range is [1.17.7, 1.19.0).
+            # OpenCode enforces only the minimum supported version.
             return subprocess.CompletedProcess(
                 args=argv, returncode=0, stdout=f"{version}\n", stderr=""
             )

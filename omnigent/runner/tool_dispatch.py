@@ -1896,19 +1896,15 @@ async def _execute_subagent_tool(
         # cause), and the orchestrator may re-dispatch into the same wall. The
         # which-probe here reads the same PATH the harness boot uses, so the
         # verdict can't disagree with the real launch.
-        from omnigent.onboarding.harness_install import missing_harness_cli
+        from omnigent.onboarding.harness_install import (
+            harness_install_spec_display,
+            missing_harness_cli,
+        )
 
         if child_harness is not None:
             missing_cli = missing_harness_cli(child_harness)
             if missing_cli is not None:
-                # Non-npm CLIs (e.g. cursor-agent) carry an ``install_hint``
-                # instead of a ``package``; using the hint avoids an
-                # ``npm install -g None`` instruction.
-                install = (
-                    f"npm install -g {missing_cli.package}"
-                    if missing_cli.package
-                    else (missing_cli.install_hint or "see the harness's install docs")
-                )
+                install = harness_install_spec_display(missing_cli)
                 return (
                     f"Error: sub-agent {sub_agent_name!r} can't start on this "
                     f"machine: harness {child_harness!r} needs the "

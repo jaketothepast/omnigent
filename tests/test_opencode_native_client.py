@@ -70,13 +70,111 @@ async def test_list_messages() -> None:
     await client.aclose()
 
 
-async def test_list_models() -> None:
+_PROVIDER_CATALOG = {
+    "connected": ["fireworks-ai", "opencode"],
+    "default": {"fireworks-ai": "accounts/fireworks/models/kimi-k3"},
+    "all": [
+        {
+            "id": "fireworks-ai",
+            "models": {
+                "accounts/fireworks/models/kimi-k3": {"name": "Kimi K3"},
+                "accounts/fireworks/models/glm-5p2": {"name": "GLM 5.2"},
+            },
+        },
+        {"id": "opencode", "models": {"laguna-s-2.1-free": {"name": "Laguna S 2.1"}}},
+        # Known to opencode but with no credentials — must be filtered out.
+        {"id": "openrouter", "models": {"z-ai/glm-5.2": {"name": "GLM 5.2"}}},
+    ],
+}
+
+
+async def test_list_models_uses_provider_catalog_filtered_to_connected() -> None:
+    """Models come from /provider, restricted to credentialed providers."""
+
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/model"
-        return httpx.Response(200, json={"models": [{"id": "opencode-go/glm-5.2"}]})
+        assert request.url.path == "/provider"
+        return httpx.Response(200, json=_PROVIDER_CATALOG)
 
     client = _client(handler)
-    assert await client.list_models() == [{"id": "opencode-go/glm-5.2"}]
+    models = await client.list_models()
+    assert [m["id"] for m in models] == [
+        "fireworks-ai/accounts/fireworks/models/kimi-k3",
+        "fireworks-ai/accounts/fireworks/models/glm-5p2",
+        "opencode/laguna-s-2.1-free",
+    ]
+    # Multi-slash model ids keep provider and model separate.
+    assert models[0]["providerID"] == "fireworks-ai"
+    assert models[0]["model"] == "accounts/fireworks/models/kimi-k3"
+    assert models[0]["isDefault"] is True
+    assert models[1]["isDefault"] is False
+    await client.aclose()
+
+
+@pytest.mark.parametrize("connected", [None, "fireworks-ai"])
+async def test_list_models_falls_back_when_connected_is_missing_or_malformed(
+    connected: object,
+) -> None:
+    """An unusable connected-provider list must not expose every provider."""
+    paths: list[str] = []
+    catalog = dict(_PROVIDER_CATALOG)
+    if connected is None:
+        catalog.pop("connected")
+    else:
+        catalog["connected"] = connected
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/provider":
+            return httpx.Response(200, json=catalog)
+        return httpx.Response(
+            200,
+            json={"models": [{"id": "glm-5.2", "providerID": "opencode-go"}]},
+        )
+
+    client = _client(handler)
+    models = await client.list_models()
+    assert [model["id"] for model in models] == ["opencode-go/glm-5.2"]
+    assert paths == ["/provider", "/api/model"]
+    await client.aclose()
+
+
+@pytest.mark.parametrize("envelope", ["data", "models"])
+async def test_list_models_falls_back_to_model_api(envelope: str) -> None:
+    """Both /api/model envelope spellings work when /provider is unusable."""
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/provider":
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            json={envelope: [{"id": "glm-5.2", "providerID": "opencode-go"}]},
+        )
+
+    client = _client(handler)
+    assert await client.list_models() == [
+        {
+            "id": "opencode-go/glm-5.2",
+            "model": "glm-5.2",
+            "providerID": "opencode-go",
+            "displayName": "opencode-go/glm-5.2",
+            "name": "glm-5.2",
+            "isDefault": False,
+        }
+    ]
+    assert paths == ["/provider", "/api/model"]
+    await client.aclose()
+
+
+async def test_list_models_empty_when_no_catalog() -> None:
+    """Both sources failing yields an empty list, not an exception."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    client = _client(handler)
+    assert await client.list_models() == []
     await client.aclose()
 
 

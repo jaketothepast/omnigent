@@ -1053,6 +1053,79 @@ def test_cursor_listing_uses_live_cli_base_models(
     assert "live models advertised" in listing.note
 
 
+@pytest.mark.parametrize("harness", ["opencode", "opencode-native", "native-opencode"])
+def test_opencode_resolves_to_its_own_cli_catalog(
+    harness: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """OpenCode workers resolve a provider instead of reporting none.
+
+    OpenCode is multi-provider and owns its catalog, so it short-circuits to
+    the CLI login the way cursor-agent does. Before this, every spelling
+    returned ``kind="none"`` and sub-agents saw an empty model list.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    provider = resolve_model_provider(_worker_spec(harness), harness)
+    assert provider.kind == "subscription"
+    assert provider.cli == "opencode"
+
+
+def test_opencode_listing_uses_live_cli_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An OpenCode worker lists the real credentialed catalog.
+
+    The ids must survive verbatim — they are fully-qualified
+    ``provider/model`` strings (fireworks ids carry several slashes) and are
+    pinned per prompt exactly as listed.
+    """
+    from omnigent import opencode_native_app_server
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    monkeypatch.setattr(
+        opencode_native_app_server,
+        "list_opencode_cli_model_options",
+        lambda: [
+            {"id": "fireworks-ai/accounts/fireworks/models/kimi-k3"},
+            {"id": "fireworks-ai/accounts/fireworks/routers/glm-5p2-fast"},
+        ],
+    )
+    listing = list_models_for_worker(_worker_spec("opencode-native"), "opencode-native")
+    assert listing.source == "cli"
+    assert listing.verified is True
+    assert [m.id for m in listing.models] == [
+        "fireworks-ai/accounts/fireworks/models/kimi-k3",
+        "fireworks-ai/accounts/fireworks/routers/glm-5p2-fast",
+    ]
+
+
+def test_opencode_listing_failure_degrades_and_is_retryable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A missing or logged-out OpenCode CLI degrades instead of raising.
+
+    The CLI lister signals these as ``RuntimeError`` subclasses, unlike the
+    Cursor lister's ``ValueError``; an escape here would surface as a hard
+    failure in the dispatch gate rather than an empty model list.
+    """
+    from omnigent import opencode_native_app_server
+
+    _isolate_config(monkeypatch, tmp_path, "")
+
+    def _not_installed() -> list[dict[str, object]]:
+        raise opencode_native_app_server.OpenCodeCliNotFoundError("opencode not on PATH")
+
+    monkeypatch.setattr(
+        opencode_native_app_server, "list_opencode_cli_model_options", _not_installed
+    )
+    listing = list_models_for_worker(_worker_spec("opencode-native"), "opencode-native")
+    assert listing.models == ()
+    assert listing.verified is False
+    assert "model enumeration failed" in listing.note
+    # Not cached, so a later login is picked up rather than replayed as empty.
+    provider = resolve_model_provider(_worker_spec("opencode-native"), "opencode-native")
+    assert model_catalog._listing_cache_key(provider) not in model_catalog._listing_cache
+
+
 def test_cursor_listing_failure_is_empty_and_retryable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

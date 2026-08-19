@@ -10,8 +10,8 @@ wire contract against the actual binary — the one thing the fakes cannot prove
 
 Environment requirements (why this is opt-in, not pure-CI)
 ----------------------------------------------------------
-* **Opt-in only**: set ``OMNIGENT_E2E_OPENCODE_NATIVE=1`` and have a pinned
-  ``opencode`` (>=1.17.7,<1.18.0) on ``PATH``. Unlike the codex/claude native
+* **Opt-in only**: set ``OMNIGENT_E2E_OPENCODE_NATIVE=1`` and have an
+  ``opencode`` (>=1.17.7; no upper bound) on ``PATH``. Unlike the codex/claude native
   e2es this needs **no** interactive login or model credential — session
   create/list, the SSE ``/event`` stream, permissions, fork and abort are all
   provider-independent. The gate just keeps it off CI runners without the binary.

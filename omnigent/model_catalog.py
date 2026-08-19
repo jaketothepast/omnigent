@@ -19,8 +19,10 @@ Enumeration is deterministic per provider kind:
 - ``key`` (openai family) / ``gateway`` / ``local`` →
   ``GET <base_url>/v1/models`` with a bearer token (source
   ``"openai-compatible"``).
-- ``subscription`` → live CLI discovery for Cursor; curated static aliases for
-  CLIs without a listing API (source ``"static"``, ``verified: false``).
+- ``subscription`` → live CLI discovery for the CLIs that can enumerate
+  their own catalog (Cursor, OpenCode — see ``_LIVE_CLI_LISTERS``); curated
+  static aliases for CLIs without a listing API (source ``"static"``,
+  ``verified: false``).
 - ``cli-config`` → the codex curated static list (source ``"static"``,
   ``verified: false`` — the credential lives in the CLI's own config
   file and is resolved by the CLI at launch).
@@ -36,6 +38,7 @@ import logging
 import os
 import subprocess
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, TypeAlias, cast
 
@@ -158,6 +161,14 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
 # short-circuits to a subscription-style readout instead of reporting the
 # harness as having "no model-provider resolution".
 _CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "native-cursor"})
+
+# OpenCode is multi-provider and owns its own catalog: models come from the
+# user's `opencode auth login` credentials across many providers (anthropic,
+# fireworks-ai, openrouter, a local server, ...), not from any omnigent-side
+# provider config. So — like cursor-agent above — resolution short-circuits to
+# the CLI's own catalog instead of reporting "no model-provider resolution",
+# which is what previously left OpenCode sub-agents with an empty model list.
+_OPENCODE_HARNESSES: frozenset[str] = frozenset({"opencode", "opencode-native", "native-opencode"})
 
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
@@ -547,6 +558,10 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
     if (harness or "") in _CURSOR_HARNESSES:
         return ResolvedModelProvider(
             kind=SUBSCRIPTION_KIND, cli="cursor-agent", detail="cursor-agent CLI login"
+        )
+    if (harness or "") in _OPENCODE_HARNESSES:
+        return ResolvedModelProvider(
+            kind=SUBSCRIPTION_KIND, cli="opencode", detail="opencode CLI login"
         )
 
     harness_type = _PROVIDER_RESOLUTION_HARNESS.get(harness or "")
@@ -1001,7 +1016,7 @@ def _listing_for_provider(
                 "this worker cannot run here"
             ),
         )
-    if provider.kind == SUBSCRIPTION_KIND and provider.cli != "cursor-agent":
+    if provider.kind == SUBSCRIPTION_KIND and provider.cli not in _LIVE_CLI_LISTERS:
         return _static_subscription_listing(provider)
     if provider.kind == CLI_CONFIG_KIND:
         return _static_cli_config_listing(provider)
@@ -1012,8 +1027,8 @@ def _listing_for_provider(
     if cached is not None:
         return cached
     try:
-        if provider.kind == SUBSCRIPTION_KIND:
-            listing = _fetch_cursor_cli_listing(provider)
+        if provider.kind == SUBSCRIPTION_KIND and provider.cli in _LIVE_CLI_LISTERS:
+            listing = _LIVE_CLI_LISTERS[provider.cli](provider)
         elif provider.kind == DATABRICKS_KIND:
             listing = _fetch_databricks_listing(provider, transport=transport)
         elif provider.kind == KEY_KIND and provider.family == ANTHROPIC_FAMILY:
@@ -1025,6 +1040,11 @@ def _listing_for_provider(
         httpx.HTTPError,
         OSError,
         ValueError,
+        # The OpenCode CLI lister signals "not installed" / "not logged in" /
+        # non-zero exit as RuntimeError (OpenCodeCliNotFoundError included).
+        # Enumeration failure must degrade to an informative empty listing,
+        # never escape into the dispatch gate.
+        RuntimeError,
         subprocess.SubprocessError,
     ) as exc:
         _logger.debug(
@@ -1058,6 +1078,42 @@ def _fetch_cursor_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
         ),
         note=f"live models advertised by the {provider.cli or 'cursor-agent'} CLI",
     )
+
+
+def _fetch_opencode_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
+    """Build a live listing from the installed OpenCode CLI.
+
+    ``opencode models --refresh`` returns the logged-in, refreshed catalog
+    the native TUI shows — every credentialed provider, as fully-qualified
+    ``provider/model`` ids. That is what the harness pins per prompt, so the
+    ids are usable as ``model`` overrides verbatim.
+
+    :param provider: The resolved provider descriptor.
+    :returns: A live ``source="cli"`` listing.
+    """
+    from omnigent.opencode_native_app_server import list_opencode_cli_model_options
+
+    options = list_opencode_cli_model_options()
+    return ModelListing(
+        source="cli",
+        verified=True,
+        models=tuple(
+            ModelEntry(id=str(option["id"]), family=model_family_token(str(option["id"])))
+            for option in options
+        ),
+        note=(
+            f"live models advertised by the {provider.cli or 'opencode'} CLI "
+            "(every credentialed provider; ids are usable as-is for a model override)"
+        ),
+    )
+
+
+# Subscription-kind CLIs that can enumerate their own live catalog, rather
+# than falling back to a curated static list. Keyed by ``provider.cli``.
+_LIVE_CLI_LISTERS: dict[str, Callable[[ResolvedModelProvider], ModelListing]] = {
+    "cursor-agent": _fetch_cursor_cli_listing,
+    "opencode": _fetch_opencode_cli_listing,
+}
 
 
 def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListing:

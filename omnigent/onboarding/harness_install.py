@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -52,10 +53,7 @@ from omnigent._platform import resolve_cli_binary
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
-from omnigent.opencode_native_client import (
-    OPENCODE_MAX_VERSION_EXCLUSIVE,
-    OPENCODE_MIN_VERSION,
-)
+from omnigent.opencode_native_client import OPENCODE_MIN_VERSION
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
 # first-run ``run`` flow falls back to it, so it has install metadata too.
@@ -203,19 +201,14 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         # ``pi >= 0.79.0``; older CLIs would prompt mid-session.
         min_version=_PI_MIN_VERSION,
     ),
-    # Pin the install to the supported 1.18.x range: opencode-ai's npm ``latest``
-    # is a ``0.0.0-beta-*`` pre-release, so a bare ``opencode-ai`` would install a
-    # version the runtime version-check (``check_opencode_version``,
-    # >=1.17.7,<1.19.0) then rejects. ``~1.18.0`` resolves to the latest 1.18.x.
-    # The same version bounds are enforced in setup via ``min_version`` /
-    # ``max_version_exclusive`` so the install/upgrade prompt fires before
-    # the runtime gate does.
+    # Keep setup on stable releases at or above the validated floor. npm semver
+    # ranges exclude prereleases unless explicitly requested, while this
+    # floor-only range remains consistent with the runtime version policy.
     OPENCODE_KEY: HarnessInstallSpec(
         "OpenCode",
         "opencode",
-        "opencode-ai@~1.18.0",
+        "opencode-ai@>=1.18.0",
         min_version=OPENCODE_MIN_VERSION,
-        max_version_exclusive=OPENCODE_MAX_VERSION_EXCLUSIVE,
     ),
     QWEN_KEY: HarnessInstallSpec(
         "Qwen Code",
@@ -1003,9 +996,18 @@ def harness_install_display(key: str) -> str:
         ``package``.
     """
     spec = harness_install_spec(key)
-    if spec is not None and spec.install_hint:
+    if spec is None:
+        raise KeyError(key)
+    return harness_install_spec_display(spec)
+
+
+def harness_install_spec_display(spec: HarnessInstallSpec) -> str:
+    """Return a shell-safe, copyable install command for *spec*."""
+    if spec.install_hint:
         return spec.install_hint
-    return " ".join(harness_install_command(key))
+    if spec.package is None:
+        raise ValueError(f"{spec.display!r} has neither an install hint nor an npm package")
+    return shlex.join(["npm", "install", "-g", spec.package])
 
 
 class HarnessInstallResult(NamedTuple):

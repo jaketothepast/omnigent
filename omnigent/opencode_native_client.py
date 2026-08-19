@@ -1,7 +1,8 @@
 """Typed HTTP + SSE client for an ``opencode serve`` native server.
 
-Shaped from the pinned OpenCode OpenAPI (``opencode`` 1.17.x–1.18.x,
-``packages/sdk/openapi.json``). This is a thin typed wrapper over the v1
+Shaped from the OpenCode OpenAPI (validated against ``opencode``
+1.17.x–1.18.x, ``packages/sdk/openapi.json``); newer releases are accepted
+with a warning. This is a thin typed wrapper over the v1
 REST endpoints the Omnigent OpenCode-native harness needs plus the SSE
 ``GET /event`` stream — not a full generated SDK. Unknown response fields
 are preserved under ``raw`` for forward-compatible logging and fixtures.
@@ -29,11 +30,20 @@ from omnigent.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
-# Supported OpenCode CLI/API version range. Accepts 1.17.7+ through the
-# entire 1.18.x line (validated against 1.18.x event/API shapes); refuses
-# 1.19+ until validated against that release.
+# Supported OpenCode CLI/API versions. 1.17.7 is a hard floor: earlier
+# releases predate the v1 endpoints this client speaks (``/session``,
+# ``/session/{id}/prompt_async``, ``/provider``), so they fail with opaque
+# 404s rather than a clear message.
+#
+# There is deliberately NO upper bound. OpenCode ships frequently and its v1
+# surface has been additive across the 1.17-1.18 line; refusing to launch on
+# an unrecognized newer release strands users on every release day for a
+# break that usually is not there. Versions above the validated line log one
+# warning and run — see ``check_opencode_version``.
 OPENCODE_MIN_VERSION = "1.17.7"
-OPENCODE_MAX_VERSION_EXCLUSIVE = "1.19.0"
+# Advisory only: the newest line this client's event/API shapes were
+# validated against. Bump when a newer line has been exercised end to end.
+OPENCODE_MAX_VALIDATED_VERSION = "1.18"
 
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
@@ -277,17 +287,139 @@ class OpenCodeClient:
 
     async def list_models(self) -> list[_JsonObject]:
         """
-        List available models (``GET /api/model``).
+        List the models this OpenCode server can actually run.
 
-        :returns: A list of model objects; empty when the server exposes
-            no model catalog.
+        Sourced from the v1 ``GET /provider`` catalog, restricted to the
+        providers OpenCode reports as ``connected`` (i.e. those the user has
+        credentials for). ``GET /api/model`` is a fallback only: verified
+        against a live 1.18.9 server, it reports just the built-in
+        ``opencode`` and ``local`` providers and omits credentialed ones such
+        as ``fireworks-ai``, so relying on it hides most of a user's models.
+
+        Rows are normalized to the shape
+        :func:`~omnigent.opencode_native_app_server.list_opencode_cli_model_options`
+        returns, because callers use the two interchangeably.
+
+        :returns: A list of model option dicts with full ``provider/model``
+            ids; empty when the server exposes no usable catalog.
         """
-        data = await self._request_json("GET", "/api/model")
-        if isinstance(data, dict):
-            models = data.get("models")
-            if isinstance(models, list):
-                return [m for m in models if isinstance(m, dict)]
-        return []
+        models = await self._list_models_from_provider_catalog()
+        if models:
+            return models
+        return await self._list_models_from_model_api()
+
+    async def _list_models_from_provider_catalog(self) -> list[_JsonObject]:
+        """
+        Build the model list from ``GET /provider``.
+
+        The payload is ``{"all": [...], "connected": [...], "default": {...}}``.
+        Only providers named in ``connected`` are kept — ``all`` enumerates
+        every provider OpenCode knows of (192 on a stock 1.18.9), the vast
+        majority of which the user has no credentials for.
+
+        :returns: Normalized model rows, or ``[]`` when unavailable.
+        """
+        try:
+            data = await self._request_json("GET", "/provider")
+        except OpenCodeClientError:
+            _logger.debug("OpenCode /provider catalog unavailable", exc_info=True)
+            return []
+        if not isinstance(data, Mapping):
+            return []
+        providers = data.get("all")
+        if not isinstance(providers, list):
+            return []
+        connected_raw = data.get("connected")
+        if not isinstance(connected_raw, list):
+            return []
+        connected = {provider for provider in connected_raw if isinstance(provider, str)}
+        defaults = data.get("default")
+        default_map: Mapping[str, object] = defaults if isinstance(defaults, Mapping) else {}
+
+        rows: list[_JsonObject] = []
+        seen: set[str] = set()
+        for provider in providers:
+            if not isinstance(provider, Mapping):
+                continue
+            provider_id = provider.get("id")
+            if not isinstance(provider_id, str) or not provider_id:
+                continue
+            if provider_id not in connected:
+                continue
+            provider_models = provider.get("models")
+            if not isinstance(provider_models, Mapping):
+                continue
+            for model_id, model in provider_models.items():
+                if not isinstance(model_id, str) or not model_id:
+                    continue
+                qualified = f"{provider_id}/{model_id}"
+                if qualified in seen:
+                    continue
+                seen.add(qualified)
+                name = model.get("name") if isinstance(model, Mapping) else None
+                rows.append(
+                    {
+                        "id": qualified,
+                        "model": model_id,
+                        "providerID": provider_id,
+                        "displayName": qualified,
+                        "name": name if isinstance(name, str) and name else model_id,
+                        "isDefault": default_map.get(provider_id) == model_id,
+                    }
+                )
+        return rows
+
+    async def _list_models_from_model_api(self) -> list[_JsonObject]:
+        """
+        Fallback model list from ``GET /api/model``.
+
+        Accepts both envelope spellings seen across releases: ``{"data": [...]}``
+        (1.18.x) and ``{"models": [...]}``. Each entry carries ``id`` and
+        ``providerID``, which are joined into the ``provider/model`` id the
+        rest of the harness pins per prompt.
+
+        :returns: Normalized model rows, or ``[]`` when unavailable.
+        """
+        try:
+            data = await self._request_json("GET", "/api/model")
+        except OpenCodeClientError:
+            _logger.debug("OpenCode /api/model catalog unavailable", exc_info=True)
+            return []
+        if not isinstance(data, Mapping):
+            return []
+        entries = data.get("data")
+        if not isinstance(entries, list):
+            entries = data.get("models")
+        if not isinstance(entries, list):
+            return []
+
+        rows: list[_JsonObject] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            model_id = entry.get("id")
+            provider_id = entry.get("providerID")
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            if not isinstance(provider_id, str) or not provider_id:
+                continue
+            qualified = f"{provider_id}/{model_id}"
+            if qualified in seen:
+                continue
+            seen.add(qualified)
+            name = entry.get("name")
+            rows.append(
+                {
+                    "id": qualified,
+                    "model": model_id,
+                    "providerID": provider_id,
+                    "displayName": qualified,
+                    "name": name if isinstance(name, str) and name else model_id,
+                    "isDefault": False,
+                }
+            )
+        return rows
 
     async def prompt(self, session_id: str, payload: _JsonMapping) -> _JsonObject:
         """

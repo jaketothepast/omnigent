@@ -49,7 +49,7 @@ from omnigent.opencode_native_bridge import (
     xdg_data_home_for_bridge_dir,
 )
 from omnigent.opencode_native_client import (
-    OPENCODE_MAX_VERSION_EXCLUSIVE,
+    OPENCODE_MAX_VALIDATED_VERSION,
     OPENCODE_MIN_VERSION,
     OpenCodeClient,
 )
@@ -148,37 +148,72 @@ def check_opencode_version(
     version: str,
     *,
     minimum: str = OPENCODE_MIN_VERSION,
-    maximum_exclusive: str = OPENCODE_MAX_VERSION_EXCLUSIVE,
+    max_validated: str = OPENCODE_MAX_VALIDATED_VERSION,
 ) -> None:
     """
-    Validate an OpenCode version against the supported range.
+    Validate an OpenCode version against the supported floor.
 
-    :param version: Version string, e.g. ``"1.17.7"``.
-    :param minimum: Inclusive lower bound.
-    :param maximum_exclusive: Exclusive upper bound.
-    :raises OpenCodeVersionError: When *version* is unparsable or outside
-        ``[minimum, maximum_exclusive)``.
+    Only the floor is enforced. Releases newer than the validated line are
+    accepted with a warning rather than refused: OpenCode's v1 surface has
+    been additive, so a hard upper bound strands users on release day for a
+    break that usually is not there. A too-OLD release still fails loud —
+    those genuinely lack the endpoints this client calls.
+
+    An unparsable version (a distro or source build with a non-semver
+    string) warns and proceeds; refusing to run because a version string
+    could not be read would be a gate on packaging, not on capability.
+
+    :param version: Version string, e.g. ``"1.18.9"``.
+    :param minimum: Inclusive lower bound; below this raises.
+    :param max_validated: Newest validated line; above this warns.
+    :raises OpenCodeVersionError: When *version* parses and is below
+        *minimum*.
     """
     try:
         parsed = Version(version)
         low = Version(minimum)
-        high = Version(maximum_exclusive)
-    except InvalidVersion as exc:
-        raise OpenCodeVersionError(f"Unparsable OpenCode version {version!r}: {exc}") from exc
-    if parsed < low or parsed >= high:
+    except InvalidVersion:
+        _logger.warning(
+            "Could not parse OpenCode version %r; proceeding anyway. Set %s=1 to silence "
+            "this check. If OpenCode misbehaves, verify it is >=%s.",
+            version,
+            _SKIP_VERSION_CHECK_ENV,
+            minimum,
+        )
+        return
+    if parsed < low:
         raise OpenCodeVersionError(
-            f"Unsupported OpenCode version {version}: requires >={minimum},<{maximum_exclusive}. "
-            "Install a pinned 'opencode-ai' release."
+            f"Unsupported OpenCode version {version}: requires >={minimum}. "
+            "Upgrade the 'opencode-ai' package (older releases lack the "
+            "/session and /provider endpoints Omnigent uses)."
+        )
+    try:
+        validated = Version(max_validated)
+    except InvalidVersion:  # pragma: no cover — constant is well-formed
+        return
+    # Compare on (major, minor) so every patch of a validated line is quiet.
+    if (parsed.major, parsed.minor) > (validated.major, validated.minor):
+        _logger.warning(
+            "OpenCode %s is newer than the %s line Omnigent has validated; proceeding. "
+            "Report any harness misbehaviour with this version.",
+            version,
+            max_validated,
         )
 
 
-def resolve_opencode_version(opencode_path: str) -> str:
+def resolve_opencode_version(opencode_path: str) -> str | None:
     """
     Run ``opencode --version`` and return the parsed version.
 
+    A binary that runs but prints no recognizable semver yields ``None``
+    rather than raising: the version gate treats an unreadable version as a
+    warning, not a failure (see :func:`check_opencode_version`). Failing to
+    execute the binary at all is still fatal — that is a broken install.
+
     :param opencode_path: Path to the ``opencode`` binary.
-    :returns: Parsed version string, e.g. ``"1.17.7"``.
-    :raises OpenCodeVersionError: When the version cannot be determined.
+    :returns: Parsed version string, e.g. ``"1.17.7"``, or ``None`` when the
+        output carries no semver.
+    :raises OpenCodeVersionError: When the binary cannot be executed.
     """
     try:
         completed = subprocess.run(
@@ -191,10 +226,7 @@ def resolve_opencode_version(opencode_path: str) -> str:
     except (OSError, subprocess.SubprocessError) as exc:
         raise OpenCodeVersionError(f"Could not run 'opencode --version': {exc}") from exc
     output = f"{completed.stdout}\n{completed.stderr}"
-    version = parse_opencode_version(output)
-    if version is None:
-        raise OpenCodeVersionError(f"Could not parse OpenCode version from: {output!r}")
-    return version
+    return parse_opencode_version(output)
 
 
 def list_opencode_cli_model_options(
@@ -467,14 +499,13 @@ class OpenCodeNativeServer:
             self.version = resolve_opencode_version(self.opencode_path)
             if os.environ.get(_SKIP_VERSION_CHECK_ENV):
                 _logger.warning(
-                    "%s set; skipping OpenCode version gate (got %s, supported >=%s,<%s)",
+                    "%s set; skipping OpenCode version gate (got %s, requires >=%s)",
                     _SKIP_VERSION_CHECK_ENV,
                     self.version,
                     OPENCODE_MIN_VERSION,
-                    OPENCODE_MAX_VERSION_EXCLUSIVE,
                 )
             else:
-                check_opencode_version(self.version)
+                check_opencode_version(self.version or "")
         if self.port is None:
             self.port = self._explicit_port or allocate_loopback_port()
         argv = self.build_argv()
