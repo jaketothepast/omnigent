@@ -151,9 +151,18 @@ def test_inject_user_message_clears_before_pasting(
         socket_path=Path(_SOCK),
         tmux_target=_TARGET,
     )
-    # Pane always reports an idle marker: _settle_pane returns immediately, the
-    # clear settles at once, and the paste-commit poll sees the needle.
-    captured = _install_fake_tmux(monkeypatch, pane_captures=["Add a follow-up hello marker"])
+    # Realistic pane sequence: idle (settle + clear), the committed draft in
+    # the composer, then the emptied composer after the verified submit.
+    captured = _install_fake_tmux(
+        monkeypatch,
+        pane_captures=[
+            "→ Add a follow-up",  # settle: idle marker
+            "→ Add a follow-up",  # clear: seed
+            "→ Add a follow-up",  # clear: stable
+            "→ hello marker",  # paste committed into the composer
+            "→ Add a follow-up",  # submit verified: draft left the composer
+        ],
+    )
     # Avoid real sleeps in the paste-commit settle.
     monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
 
@@ -361,3 +370,116 @@ class TestHooksConfig:
         assert payload["hooks"]["stop"][0]["command"].endswith(str(bridge_dir))
         # No leftover temp file from the atomic write.
         assert not (workspace / ".cursor" / "hooks.json.tmp").exists()
+
+
+class TestDraftInComposer:
+    """``_draft_in_composer`` — chip-aware draft detection in the composer line.
+
+    cursor-agent renders any multi-line paste as a ``[Pasted text #N +M lines]``
+    chip, so the raw text needle NEVER appears in the pane for multi-line
+    messages — draft detection must accept the chip as well. Only the LAST
+    ``→`` line counts (the live composer sits at the bottom); a submitted
+    chip's transcript echo has no ``→`` prefix and must not match.
+    """
+
+    def test_single_line_draft_matches_needle(self) -> None:
+        pane = "Cursor Agent\n → hello marker\n Cursor Grok"
+        assert cursor_native_bridge._draft_in_composer(pane, "hello marker") is True
+
+    def test_multiline_draft_matches_pasted_chip(self) -> None:
+        pane = "Cursor Agent\n → [Pasted text #1 +11 lines]\n Cursor Grok"
+        assert cursor_native_bridge._draft_in_composer(pane, "READ-ONLY research task,") is True
+
+    def test_idle_placeholder_is_not_a_draft(self) -> None:
+        pane = "Cursor Agent\n → Plan, search, build anything\n Cursor Grok"
+        assert cursor_native_bridge._draft_in_composer(pane, "hello marker") is False
+
+    def test_submitted_chip_in_transcript_is_not_a_draft(self) -> None:
+        # Post-submit: chip echoes in the transcript (no →), composer shows the
+        # follow-up placeholder — the draft has left the box.
+        pane = " [Pasted text #1 +11 lines]\n Working\n → Add a follow-up\n Cursor Grok"
+        assert cursor_native_bridge._draft_in_composer(pane, "READ-ONLY research task,") is False
+
+    def test_empty_pane_is_not_a_draft(self) -> None:
+        assert cursor_native_bridge._draft_in_composer("", "hello") is False
+
+
+class TestVerifiedSubmit:
+    """``inject_user_message`` must verify delivery, not fire-and-forget.
+
+    Regression for the silent-hang bug: the first web message raced
+    cursor-agent's TUI boot, the paste was swallowed, the needle poll (which
+    can never match a multi-line paste — it renders as a chip) timed out, and
+    a blind Enter "succeeded" into an idle TUI. Omnigent marked the turn
+    complete; cursor never saw a message; the session hung with no error.
+    """
+
+    def _bridge(self, tmp_path: Path) -> Path:
+        return _prepare_bridge(tmp_path)
+
+    def test_multiline_submit_verified_via_chip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Chip appears in composer, Enter submits, chip leaves -> one Enter, no raise."""
+        bridge_dir = self._bridge(tmp_path)
+        captures = [
+            "→ Plan, search, build anything",  # settle
+            "→ Plan, search, build anything",  # clear seed
+            "→ Plan, search, build anything",  # clear settle
+            "→ [Pasted text #1 +11 lines]",  # draft committed
+            "[Pasted text #1 +11 lines]\n→ Add a follow-up",  # submitted
+        ]
+        captured = _install_fake_tmux(monkeypatch, pane_captures=captures)
+        monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
+
+        cursor_native_bridge.inject_user_message(
+            bridge_dir, content="line one\nline two\nline three"
+        )
+
+        enters = [t for t in _send_keys_calls(captured) if t == ["-t", _TARGET, "Enter"]]
+        assert len(enters) == 1
+
+    def test_swallowed_paste_is_retried_then_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A paste that never renders is re-pasted; if it never lands, raise.
+
+        This is the exact silent-loss case from the field: the pane stays on
+        the idle placeholder forever. Old behavior submitted blind and
+        reported success; new behavior retries the paste and finally raises so
+        the runner surfaces ExecutorError instead of a phantom-complete turn.
+        """
+        bridge_dir = self._bridge(tmp_path)
+        captured = _install_fake_tmux(
+            monkeypatch, pane_captures=["→ Plan, search, build anything"]
+        )
+        monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
+        # Collapse the poll deadlines so the test doesn't wall-clock the timeouts.
+        ticks = iter(range(1, 100000))
+        monkeypatch.setattr(
+            cursor_native_bridge.time, "monotonic", lambda: float(next(ticks) * 10)
+        )
+
+        with pytest.raises(RuntimeError, match="not delivered"):
+            cursor_native_bridge.inject_user_message(bridge_dir, content="hello marker")
+
+        pastes = [c for c in captured if "paste-buffer" in c]
+        assert len(pastes) == cursor_native_bridge._PASTE_ATTEMPTS
+        # A paste that never committed must never be blind-submitted.
+        assert ["-t", _TARGET, "Enter"] not in _send_keys_calls(captured)
+
+    def test_stuck_draft_resends_enter_then_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A committed draft that never leaves the composer re-Enters, then raises."""
+        bridge_dir = self._bridge(tmp_path)
+        captured = _install_fake_tmux(monkeypatch, pane_captures=["→ hello marker"])
+        monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
+        ticks = iter(range(1, 100000))
+        monkeypatch.setattr(cursor_native_bridge.time, "monotonic", lambda: float(next(ticks) * 2))
+
+        with pytest.raises(RuntimeError, match="did not accept"):
+            cursor_native_bridge.inject_user_message(bridge_dir, content="hello marker")
+
+        enters = [t for t in _send_keys_calls(captured) if t == ["-t", _TARGET, "Enter"]]
+        assert len(enters) >= 2, "the submit Enter must be re-sent while the draft is stuck"

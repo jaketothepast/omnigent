@@ -78,6 +78,25 @@ _PASTE_BUFFER = "omnigent-cursor-paste"
 # sending Enter — submitting before the TUI commits the paste folds the Enter
 # into the paste as a newline and the message sits unsent.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
+# cursor-agent renders ANY multi-line paste as a ``[Pasted text #N +M lines]``
+# chip — the raw text never appears in the pane, so draft detection matches
+# the chip as well as the text needle.
+_PASTED_CHIP_MARKER = "[Pasted text"
+# The live composer is the LAST pane line carrying this glyph (a submitted
+# chip's transcript echo has no glyph), mirroring claude-native's
+# ``_CLAUDE_PROMPT_GLYPH`` bottom-line rule.
+_COMPOSER_GLYPH = "→"
+# Verified submit (ported from claude-native): after Enter, wait for the draft
+# to leave the composer, re-sending Enter while it verifiably sits there, and
+# raise when it never submits — a silent no-delivery otherwise reads as a
+# successful turn and the session hangs with no error.
+_SUBMIT_VERIFY_TIMEOUT_S = 10.0
+_SUBMIT_RETRY_INTERVAL_S = 1.0
+# Full clear+paste attempts when the paste never renders in the composer: a
+# still-booting TUI can swallow the entire burst (seen in the field on the
+# first message of a fresh session), and nothing was committed, so re-pasting
+# cannot double-send. Each retry lands on a warmer TUI.
+_PASTE_ATTEMPTS = 3
 # Pause between the ``/model`` filter landing and Enter. cursor-agent's
 # composer debounces input (~1.5s); an Enter fired too soon selects a stale
 # picker highlight. See the cursor-native e2e_ui TUI-driving notes.
@@ -638,6 +657,32 @@ def _submit_needle(content: str) -> str:
     return stripped[:24] if len(stripped) >= 4 else ""
 
 
+def _draft_in_composer(pane: str, needle: str) -> bool:
+    """
+    Return whether the pasted draft is visible in cursor-agent's composer.
+
+    Looks only at the **last** line containing :data:`_COMPOSER_GLYPH` — the
+    live composer always sits at the bottom of the pane, so this never matches
+    a submitted message's transcript echo (which carries no glyph). The draft
+    counts as visible when the text after the glyph contains *needle* (small
+    pastes render verbatim) or the :data:`_PASTED_CHIP_MARKER` chip
+    (cursor-agent collapses any multi-line paste into a chip, so the raw text
+    of a multi-line message never appears in the pane).
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :param needle: Marker from :func:`_submit_needle`; empty means the draft
+        can't be identified by text and only the chip is considered.
+    :returns: ``True`` when the draft is still sitting in the composer.
+    """
+    glyph_lines = [line for line in pane.splitlines() if _COMPOSER_GLYPH in line]
+    if not glyph_lines:
+        return False
+    tail = glyph_lines[-1].rsplit(_COMPOSER_GLYPH, 1)[1]
+    if _PASTED_CHIP_MARKER in tail:
+        return True
+    return bool(needle) and needle in tail
+
+
 def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
     """Best-effort wait until the Cursor input box is ready to receive a paste.
 
@@ -703,13 +748,21 @@ def inject_user_message(
 
     Clears any leftover draft, pastes *content* (multi-line safe via
     ``load-buffer``/``paste-buffer -p`` so interior newlines stay data, not
-    submits), settles, then submits with Enter.
+    submits), waits for the draft to render in the composer, then submits with
+    Enter and **verifies** the draft left the composer (re-sending Enter while
+    it verifiably sits there). A paste that never renders is retried from the
+    clear — a still-booting TUI can swallow the whole burst, and since nothing
+    was committed a re-paste cannot double-send. Never submits blind: a blind
+    Enter into an idle TUI reads as a successful turn while cursor never saw a
+    message, and the session hangs with no error.
 
     :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
     :param content: User text (non-empty).
     :param timeout_s: Per-readiness-gate timeout.
-    :raises RuntimeError: If the tmux target is never advertised or a tmux
-        command fails.
+    :raises RuntimeError: If the tmux target is never advertised, a tmux
+        command fails, the paste never renders in the composer after
+        :data:`_PASTE_ATTEMPTS` attempts, or the draft never leaves the
+        composer after the submit Enter (message not delivered).
     """
     if not content:
         raise RuntimeError("cursor-native injection requires non-empty content")
@@ -724,43 +777,76 @@ def inject_user_message(
             "cursor terminal is no longer running (the TUI exited); restart the session"
         )
     _settle_pane(socket_path, tmux_target, timeout_s=timeout_s)
-    # Clear any leftover draft (e.g. the prompt cursor-agent restores into the
-    # composer after a cancelled turn) so it can't prepend the new message.
-    _clear_composer(socket_path, tmux_target)
-    with tempfile.NamedTemporaryFile(
-        dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-    ) as paste_file:
-        # Trailing newline absorbs any trailing backslash so it can't escape Enter.
-        paste_file.write(_paste_payload_bytes(content + "\n"))
-        paste_path = paste_file.name
-    try:
-        _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
-        _run_tmux(
-            socket_path,
-            "paste-buffer",
-            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
-            "-d",  # drop the buffer after pasting
-            "-b",
-            _PASTE_BUFFER,
-            "-t",
-            tmux_target,
-        )
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(paste_path)
-    # Wait until the paste is visibly committed to the input box before Enter.
-    # Submitting mid-paste folds the Enter in as a newline (the cursor TUI
-    # coalesces rapid stdin bursts), leaving the message unsent. Poll for the
-    # text, then submit; fall through to a blind submit if no needle is usable.
     needle = _submit_needle(content)
-    if needle:
+    for _attempt in range(_PASTE_ATTEMPTS):
+        # Clear any leftover draft (e.g. the prompt cursor-agent restores into
+        # the composer after a cancelled turn, or a partial prior paste) so it
+        # can't prepend the new message.
+        _clear_composer(socket_path, tmux_target)
+        with tempfile.NamedTemporaryFile(
+            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
+        ) as paste_file:
+            # Trailing newline absorbs any trailing backslash so it can't escape Enter.
+            paste_file.write(_paste_payload_bytes(content + "\n"))
+            paste_path = paste_file.name
+        try:
+            _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
+            _run_tmux(
+                socket_path,
+                "paste-buffer",
+                "-p",  # bracketed-paste markers — the TUI keeps newlines as data
+                "-d",  # drop the buffer after pasting
+                "-b",
+                _PASTE_BUFFER,
+                "-t",
+                tmux_target,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(paste_path)
+        # Wait until the paste is visibly committed to the composer before
+        # Enter. Submitting mid-paste folds the Enter in as a newline (the
+        # cursor TUI coalesces rapid stdin bursts), leaving the message unsent.
+        # Multi-line pastes render as a "[Pasted text ...]" chip, never as the
+        # raw text, so the check is chip-aware (_draft_in_composer).
+        draft_seen = False
         deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
         while time.monotonic() < deadline:
-            if needle in _capture_pane(socket_path, tmux_target):
+            if _draft_in_composer(_capture_pane(socket_path, tmux_target), needle):
+                draft_seen = True
                 break
             time.sleep(_POLL_INTERVAL_S)
-    time.sleep(_PASTE_SETTLE_S)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        if not draft_seen:
+            # The TUI swallowed the paste (still booting / redrawing). Nothing
+            # was committed, so retry the whole clear+paste on a warmer TUI.
+            continue
+        time.sleep(_PASTE_SETTLE_S)
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        # Verify the submit took: a successful Enter clears the composer. If
+        # the draft is still sitting there the Enter was swallowed into the
+        # paste burst as a newline — re-send it (the retry lands well after
+        # the burst, so it submits). Each Enter only fires while the draft is
+        # verifiably still present, so a retry can never hit an empty prompt.
+        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+        last_enter = time.monotonic()
+        while time.monotonic() < deadline:
+            time.sleep(_POLL_INTERVAL_S)
+            pane = _capture_pane(socket_path, tmux_target)
+            if not _draft_in_composer(pane, needle):
+                return
+            if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+                last_enter = time.monotonic()
+        raise RuntimeError(
+            f"cursor-agent did not accept the submitted message within "
+            f"{_SUBMIT_VERIFY_TIMEOUT_S:.0f}s (the draft is still in the composer). "
+            "The message was not delivered."
+        )
+    raise RuntimeError(
+        f"cursor-agent never rendered the pasted message after {_PASTE_ATTEMPTS} "
+        "attempts (the TUI swallowed the paste). The message was not delivered; "
+        "re-send it once the cursor terminal is responsive."
+    )
 
 
 def inject_model_command(
