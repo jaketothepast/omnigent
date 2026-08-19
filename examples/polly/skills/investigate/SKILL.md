@@ -34,6 +34,10 @@ repository-specific technical question.
    `sys_session_get_history` only to debug an empty or unclear worker result; if
    reports conflict or are incomplete, dispatch a follow-up `explore` task
    rather than resolving the conflict from your own direct inspection.
+   Workers boot a full terminal UI before producing transcript, and transcripts
+   mirror back with a lag — an empty history in a worker's first minutes is
+   normal, not a dead worker. Never cancel-and-redispatch on an empty early
+   history; wait for the inbox notification.
 5. If the investigation uncovers required code changes, switch to `fanout` /
    `cross-review`: dispatch an `implement` worker, then verify with the
    opposite-vendor `review` worker.

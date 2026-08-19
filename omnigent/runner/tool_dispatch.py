@@ -4771,6 +4771,34 @@ async def _session_parent_id(
     return parent if isinstance(parent, str) and parent else None
 
 
+#: Appended to a ``sys_session_get_history`` result whose items carry no
+#: conversation content yet. Native workers run as terminal UIs that take
+#: minutes to boot (MCP servers, session hooks) and their transcripts mirror
+#: back with a forwarder lag, so an early-empty history is the NORMAL state of
+#: a healthy, freshly dispatched worker — not a dead one.
+_PEEK_EMPTY_HISTORY_NOTE = (
+    "This session's transcript is empty so far. Native workers run as "
+    "terminal UIs that can take a few minutes to boot, and their transcripts "
+    "mirror back with a lag — an empty history shortly after dispatch does "
+    "NOT mean the worker is dead or stuck. Do not cancel or re-dispatch it on "
+    "this basis; wait for its inbox notification (sys_read_inbox), or check "
+    "again after a few minutes."
+)
+
+
+def _peek_items_substantive(items: list[_JsonObject]) -> bool:
+    """Return whether any peeked item carries conversation content.
+
+    Resource events (terminal created, environments, …) are emitted during
+    session setup before the worker has said or done anything — a history
+    holding only those is "empty" for liveness-judgment purposes.
+    """
+    return any(
+        isinstance(item, dict) and item.get("type") not in (None, "resource_event")
+        for item in items
+    )
+
+
 async def _session_get_history_via_rest(
     args: _JsonObject,
     server_client: httpx.AsyncClient,
@@ -4825,14 +4853,21 @@ async def _session_get_history_via_rest(
     items.extend(
         pending_elicitations.project_for_peek(event) for event in meta.pending_elicitations
     )
-    return json.dumps(
-        {
-            "conversation_id": target_id,
-            "agent": meta.agent,
-            "title": meta.title,
-            "items": items,
-        }
-    )
+    payload: _JsonObject = {
+        "conversation_id": target_id,
+        "agent": meta.agent,
+        "title": meta.title,
+        "items": items,
+    }
+    # A native worker (claude_code/cursor/codex/...) boots a full terminal UI
+    # before producing any transcript, and the transcript mirrors back with an
+    # additional forwarder lag — so shortly after dispatch its history holds at
+    # most resource events. Orchestrators have misread that as a dead worker
+    # and cancel-and-redispatched healthy ones; say explicitly that emptiness
+    # here is not evidence of death.
+    if not _peek_items_substantive(items):
+        payload["note"] = _PEEK_EMPTY_HISTORY_NOTE
+    return json.dumps(payload)
 
 
 async def _fetch_close_target(
