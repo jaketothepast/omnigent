@@ -78,9 +78,10 @@ _PASTE_BUFFER = "omnigent-cursor-paste"
 # sending Enter — submitting before the TUI commits the paste folds the Enter
 # into the paste as a newline and the message sits unsent.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
-# cursor-agent renders ANY multi-line paste as a ``[Pasted text #N +M lines]``
-# chip — the raw text never appears in the pane, so draft detection matches
-# the chip as well as the text needle.
+# cursor-agent <=2026.07 renders multi-line pastes as a ``[Pasted text #N +M
+# lines]`` chip (raw text never appears); 2026.08+ renders the raw text in a
+# height-capped viewport instead. Draft detection matches the chip, the text
+# needle, AND a whitespace-stripped tail needle (see _draft_in_composer).
 _PASTED_CHIP_MARKER = "[Pasted text"
 # The live composer is the LAST pane line carrying this glyph (a submitted
 # chip's transcript echo has no glyph), mirroring claude-native's
@@ -657,30 +658,61 @@ def _submit_needle(content: str) -> str:
     return stripped[:24] if len(stripped) >= 4 else ""
 
 
-def _draft_in_composer(pane: str, needle: str) -> bool:
+def _strip_whitespace(text: str) -> str:
+    """Collapse *text* to its non-whitespace characters (wrap-proof matching)."""
+    return "".join(text.split())
+
+
+def _tail_needle(content: str) -> str:
+    """The last 24 non-whitespace characters of *content*.
+
+    The composer viewport is height-capped: when the transcript squeezes it and
+    the draft is long, only the draft's TAIL rows are visible (the first line —
+    and with it :func:`_submit_needle` — scrolls off). The tail survives that,
+    but the TUI re-wraps it at pane width, so callers must match it against a
+    whitespace-stripped region (:func:`_strip_whitespace`), never raw lines.
+    """
+    stripped = _strip_whitespace(content)
+    return stripped[-24:] if len(stripped) >= 4 else ""
+
+
+def _draft_in_composer(pane: str, needle: str, tail: str = "") -> bool:
     """
     Return whether the pasted draft is visible in cursor-agent's composer.
 
-    Looks only at the **last** line containing :data:`_COMPOSER_GLYPH` — the
-    live composer always sits at the bottom of the pane, so this never matches
-    a submitted message's transcript echo (which carries no glyph). The draft
-    counts as visible when the text after the glyph contains *needle* (small
-    pastes render verbatim) or the :data:`_PASTED_CHIP_MARKER` chip
-    (cursor-agent collapses any multi-line paste into a chip, so the raw text
-    of a multi-line message never appears in the pane).
+    The composer region is everything from the **last** line containing
+    :data:`_COMPOSER_GLYPH` to the bottom of the pane — the live composer sits
+    below the transcript (whose echoes carry no glyph), so a submitted
+    message's transcript echo never matches. The draft counts as visible when
+    the region contains any of:
+
+    - the :data:`_PASTED_CHIP_MARKER` chip (cursor-agent <=2026.07 collapses
+      multi-line pastes into a ``[Pasted text ...]`` chip);
+    - *needle* — the draft's first line (small drafts render verbatim);
+    - *tail* — the draft's last non-whitespace characters, compared
+      whitespace-stripped. Newer cursor-agent (2026.08+) renders multi-line
+      pastes as raw text in a height-capped viewport: a long draft scrolls so
+      only its tail rows show, re-wrapped at pane width, so neither the chip
+      nor the first-line needle can ever match there.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :param needle: Marker from :func:`_submit_needle`; empty means the draft
-        can't be identified by text and only the chip is considered.
+    :param needle: Marker from :func:`_submit_needle`; empty means the first
+        line can't identify the draft.
+    :param tail: Marker from :func:`_tail_needle`; empty disables tail
+        matching.
     :returns: ``True`` when the draft is still sitting in the composer.
     """
-    glyph_lines = [line for line in pane.splitlines() if _COMPOSER_GLYPH in line]
-    if not glyph_lines:
+    lines = pane.splitlines()
+    glyph_indexes = [i for i, line in enumerate(lines) if _COMPOSER_GLYPH in line]
+    if not glyph_indexes:
         return False
-    tail = glyph_lines[-1].rsplit(_COMPOSER_GLYPH, 1)[1]
-    if _PASTED_CHIP_MARKER in tail:
+    first_region_line = lines[glyph_indexes[-1]].rsplit(_COMPOSER_GLYPH, 1)[1]
+    region = "\n".join([first_region_line, *lines[glyph_indexes[-1] + 1 :]])
+    if _PASTED_CHIP_MARKER in region:
         return True
-    return bool(needle) and needle in tail
+    if needle and needle in region:
+        return True
+    return bool(tail) and tail in _strip_whitespace(region)
 
 
 def _settle_pane(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
@@ -778,6 +810,7 @@ def inject_user_message(
         )
     _settle_pane(socket_path, tmux_target, timeout_s=timeout_s)
     needle = _submit_needle(content)
+    tail = _tail_needle(content)
     for _attempt in range(_PASTE_ATTEMPTS):
         # Clear any leftover draft (e.g. the prompt cursor-agent restores into
         # the composer after a cancelled turn, or a partial prior paste) so it
@@ -812,7 +845,7 @@ def inject_user_message(
         draft_seen = False
         deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
         while time.monotonic() < deadline:
-            if _draft_in_composer(_capture_pane(socket_path, tmux_target), needle):
+            if _draft_in_composer(_capture_pane(socket_path, tmux_target), needle, tail):
                 draft_seen = True
                 break
             time.sleep(_POLL_INTERVAL_S)
@@ -832,7 +865,7 @@ def inject_user_message(
         while time.monotonic() < deadline:
             time.sleep(_POLL_INTERVAL_S)
             pane = _capture_pane(socket_path, tmux_target)
-            if not _draft_in_composer(pane, needle):
+            if not _draft_in_composer(pane, needle, tail):
                 return
             if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")

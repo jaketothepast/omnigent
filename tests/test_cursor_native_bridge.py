@@ -483,3 +483,60 @@ class TestVerifiedSubmit:
 
         enters = [t for t in _send_keys_calls(captured) if t == ["-t", _TARGET, "Enter"]]
         assert len(enters) >= 2, "the submit Enter must be re-sent while the draft is stuck"
+
+
+class TestScrolledComposerDraft:
+    """Newer cursor-agent (2026.08+) renders multi-line pastes as raw text in a
+    height-capped composer: a long draft scrolls so only its TAIL rows show,
+    re-wrapped at pane width. Field failure: the first-line needle was off-
+    screen, no chip existed, and three paste attempts "failed" while the draft
+    sat right there — the tail needle must catch this.
+    """
+
+    _CONTENT = (
+        "I only received sections 1 and 2 (tech stack table).\n"
+        "Please resend ONLY the remainder, sections 3 through 7:\n"
+        "short bullet points, keep file-path citations,\n"
+        "no tables, total under about 350 words."
+    )
+
+    def _scrolled_pane(self) -> str:
+        # First draft line scrolled off; visible tail rows re-wrapped by the TUI.
+        return (
+            "  transcript above\n"
+            " →  ONLY the remainder, sections 3\n"
+            "    through 7: short bullet points,\n"
+            "    keep file-path citations, no tables,\n"
+            "    total under about 350 words.\n"
+            "  Cursor Grok 4.5 High Fast\n"
+        )
+
+    def test_tail_needle_matches_scrolled_rewrapped_draft(self) -> None:
+        needle = cursor_native_bridge._submit_needle(self._CONTENT)
+        tail = cursor_native_bridge._tail_needle(self._CONTENT)
+        pane = self._scrolled_pane()
+        # The old checks genuinely cannot see this draft...
+        assert needle not in pane
+        assert cursor_native_bridge._PASTED_CHIP_MARKER not in pane
+        # ...the tail needle can.
+        assert cursor_native_bridge._draft_in_composer(pane, needle, tail) is True
+
+    def test_tail_needle_absent_after_submit(self) -> None:
+        # Post-submit: transcript may echo the message ABOVE the composer, but
+        # the composer region (last -> line downward) holds only the
+        # placeholder — the draft must count as gone.
+        tail = cursor_native_bridge._tail_needle(self._CONTENT)
+        pane = (
+            "  I only received sections 1 and 2 (tech stack table).\n"
+            "  total under about 350 words.\n"
+            " → Add a follow-up\n"
+            "  Cursor Grok 4.5 High Fast\n"
+        )
+        assert (
+            cursor_native_bridge._draft_in_composer(pane, "I only received sections", tail)
+            is False
+        )
+
+    def test_tail_needle_strips_whitespace(self) -> None:
+        assert " " not in cursor_native_bridge._tail_needle("hello there world  ")
+        assert cursor_native_bridge._tail_needle("hi") == ""
