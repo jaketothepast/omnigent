@@ -36,7 +36,9 @@ dependency).
    finishes. Collect its structured result with `sys_read_inbox` and record the
    PR URL in the registry. If the inbox result is empty/unclear, inspect that
    worker conversation with `sys_session_get_history` before deciding what to do
-   next.
+   next. Workers are terminal-UI agents that take a few minutes to boot, and
+   their transcripts mirror back with a lag — an EMPTY history shortly after
+   dispatch is NORMAL and is not evidence the worker is dead.
 4. Send each finished task's PR through `cross-review`.
 5. polly does NOT merge — the PR is the deliverable. When cross-review passes,
    the task is done: mark it ready in the registry with its PR URL and leave it
@@ -54,6 +56,14 @@ dependency).
   `sys_cancel_task` with `task_id` set to the recorded `conversation_id` before
   dispatching a replacement. `claude_code` is hard-stopped; `codex` cancellation
   is best-effort until its runner-side hard-stop exists.
+- NEVER cancel a worker merely because its history is empty or quiet in its
+  first minutes — native workers boot a full terminal UI (MCP servers, session
+  hooks) before producing any transcript, and the transcript mirrors back with
+  an additional lag. Cancel only on positive evidence (wrong output, runaway
+  edits, superseded scope) or after the worker has produced nothing for far
+  longer than its expected runtime. When unsure, wait for its inbox
+  notification instead of cancel-and-redispatch: a kill-and-retry loop wastes
+  the work of healthy workers that were merely still booting.
 - A sub-agent that returns a dark or failing result: don't re-prompt it in a
   loop — re-dispatch a fresh implementation sub-agent in a clean worktree, or
   escalate to the user.
